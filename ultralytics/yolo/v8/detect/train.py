@@ -12,7 +12,7 @@ from ultralytics.yolo.data import build_dataloader
 from ultralytics.yolo.data.dataloaders.v5loader import create_dataloader
 from ultralytics.yolo.engine.trainer import BaseTrainer
 from ultralytics.yolo.utils import DEFAULT_CONFIG, colorstr
-from ultralytics.yolo.utils.loss import BboxLoss
+from ultralytics.yolo.utils.loss import BboxLoss, InnerSioULoss
 from ultralytics.yolo.utils.ops import xywh2xyxy
 from ultralytics.yolo.utils.plotting import plot_images, plot_results
 from ultralytics.yolo.utils.tal import TaskAlignedAssigner, dist2bbox, make_anchors
@@ -123,7 +123,8 @@ class Loss:
 
         self.use_dfl = m.reg_max > 1
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
+        # self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
+        self.bbox_loss = InnerSioULoss().to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets, batch_size, scale_tensor):
@@ -150,6 +151,7 @@ class Loss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds, batch):
+        # loss = torch.zeros(2, device=self.device)  # box, cls, dfl
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -185,12 +187,12 @@ class Loss:
 
         # bbox loss
         if fg_mask.sum():
-            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores,
-                                              target_scores_sum, fg_mask)
+            # loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask)
+            loss[0] = self.bbox_loss(pred_bboxes, target_bboxes, fg_mask)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
+        # loss[2] *= self.hyp.dfl  # dfl gain
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 

@@ -190,6 +190,50 @@ class C2f(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
+class DWRBlock(nn.Module):
+    def __init__(self, c1, c2, dilation_rates=[1, 2, 3]):
+        super().__init__()
+        self.groups = len(dilation_rates)
+        self.group_channels = c2 // self.groups
+        self.remaining = c2 % self.groups
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(c1, c2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True)
+        )
+
+        self.dilated_convs = nn.ModuleList([
+            nn.Conv2d(self.group_channels, self.group_channels, 3, padding=r, dilation=r,
+                      groups=self.group_channels, bias=False)
+            for r in dilation_rates
+        ])
+
+        self.bn = nn.BatchNorm2d(c2)
+        self.pointwise = nn.Conv2d(c2, c2, 1)
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        splits = torch.split(x1[:, :self.group_channels * self.groups], self.group_channels, dim=1)
+        out = [conv(f) for conv, f in zip(self.dilated_convs, splits)]
+        if self.remaining > 0:
+            out.append(x1[:, -self.remaining:, :, :])
+        out = torch.cat(out, dim=1)
+        out = self.bn(out)
+        out = self.pointwise(out)
+        return x + out
+
+class C2f_DWR(nn.Module):
+    def __init__(self, c1, c2, n=1):
+        super().__init__()
+        self.cv1 = nn.Conv2d(c1, c2, 1, 1)
+        self.cv2 = nn.Conv2d(c2, c2, 1, 1)
+        self.m = nn.Sequential(*[DWRBlock(c2, c2) for _ in range(n)])
+
+    def forward(self, x):
+        x = self.cv1(x)
+        y = self.m(x)
+        return self.cv2(y) + x
 
 class ChannelAttention(nn.Module):
     # Channel-attention module https://github.com/open-mmlab/mmdetection/tree/v3.0.0rc1/configs/rtmdet
@@ -296,6 +340,88 @@ class SPPF(nn.Module):
             y2 = self.m(y1)
             return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
 
+# class SPPF_LSKA(nn.Module):
+#     def __init__(self, c1, c2, k=5):  # k is the kernel size for MaxPool2d
+#         super().__init__()
+#         c_ = c1 // 2  # hidden channels
+#         self.cv1 = Conv(c1, c_, 1, 1)
+#         self.cv2 = Conv(c_ * 4, c2, 1, 1)
+#         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+#         # Define LSKA layer (you can replace it with the actual layer/operation)
+#         self.lska = nn.Sequential(
+#             # Add some layers for LSKA operation if needed
+#             nn.Conv2d(c_ * 4, c2, 1, 1), 
+#             nn.ReLU(inplace=True)
+#         )
+    
+#     def forward(self, x):
+#         x1 = self.cv1(x)
+#         with warnings.catch_warnings():
+#             warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+#             x2 = self.m(x1)
+#             x3 = self.m(x2)
+#             x4 = self.m(x3)
+#             concatenated = torch.cat((x1, x2, x3, x4), 1)  # Concatenate all the layers
+#             print("11111111111111111111111111111111111111")
+#             print({concatenated.shape})
+#             print("22222222222222222222222222222222222222")
+#             lska_out = self.lska(concatenated)  # Apply LSKA operation (e.g., conv + relu)
+#             print("33333333333333333333333333333333333")
+#             return self.cv2(lska_out)  # Final convolution after LSKA
+
+class LSKA(nn.Module):
+    def __init__(self, channels, d=3, k=9):
+        super().__init__()
+        self.dw_conv1 = nn.Conv2d(channels, channels, (1, 2 * d - 1), stride=1,
+                                  padding=(0, d - 1), groups=channels)
+        self.dw_conv2 = nn.Conv2d(channels, channels, (2 * d - 1, 1), stride=1,
+                                  padding=(d - 1, 0), groups=channels)
+
+        dil_k = k // d
+        self.dw_dconv1 = nn.Conv2d(channels, channels, (1, dil_k), stride=1,
+                                   padding=(0, dil_k // 2), dilation=(1, d), groups=channels)
+        self.dw_dconv2 = nn.Conv2d(channels, channels, (dil_k, 1), stride=1,
+                                   padding=(dil_k // 2, 0), dilation=(d, 1), groups=channels)
+
+        self.pw_conv = nn.Conv2d(channels, channels, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        input = x  # Save for element-wise product
+        attn = self.dw_conv1(x)
+        attn = self.dw_conv2(attn)
+        attn = self.dw_dconv1(attn)
+        attn = self.dw_dconv2(attn)
+        attn = self.sigmoid(self.pw_conv(attn))
+        
+        # Ensure attn and input have same shape
+        if attn.shape != input.shape:
+            attn = nn.functional.interpolate(attn, size=input.shape[2:], mode="nearest")
+
+        return input * attn
+
+# --- SPPF + LSKA module ---
+class SPPF_LSKA(nn.Module):
+    def __init__(self, c1, c2, k=5, d=3, lska_k=9):
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.lska = LSKA(c_ * 4, d=d, k=lska_k)
+        self.cv2 = Conv(c_ * 8, c2, 1, 1)  # input doubled due to LSKA output concat
+
+    def forward(self, x):
+        x = self.cv1(x)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            x1 = x
+            x2 = self.m(x1)
+            x3 = self.m(x2)
+            x4 = self.m(x3)
+            cat = torch.cat((x1, x2, x3, x4), 1)
+            attn = self.lska(cat)
+            out = torch.cat((cat, attn), 1)
+            return self.cv2(out)
 
 class Focus(nn.Module):
     # Focus wh information into c-space
@@ -373,6 +499,21 @@ class Ensemble(nn.ModuleList):
         y = torch.cat(y, 1)  # nms ensemble
         return y, None  # inference, train output
 
+class RepConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.identity = nn.BatchNorm2d(in_channels) if in_channels == out_channels else None
+        self.conv3x3 = nn.Sequential(nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+                                     nn.BatchNorm2d(out_channels))
+        self.conv1x1 = nn.Sequential(nn.Conv2d(in_channels, out_channels, 1, padding=0, bias=False),
+                                     nn.BatchNorm2d(out_channels))
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        o1 = self.identity(x)
+        o2 = self.identity(self.conv1x1(x))
+        o3 = self.identity(self.conv3x3(x))
+        return self.act(o1 + o2 + o3)
 
 # heads
 class Detect(nn.Module):
@@ -387,20 +528,24 @@ class Detect(nn.Module):
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
-        self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+        self.reg_max = 16  # DFL channels (ch[0] //+ 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
 
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], self.nc)  # channels
+        self.cv1 = nn.ModuleList(
+            [nn.Sequential(RepConv(x, x), RepConv(x, x)) for x in ch])
         self.cv2 = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch)
-        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            [nn.Sequential(nn.Conv2d(x, 4 * self.reg_max, 1)) for x in ch])
+            # nn.Sequential(RepConv(x, x), RepConv(x, x), nn.Conv2d(x, c2, 1)) for x in ch)
+        self.cv3 = nn.ModuleList([nn.Sequential(nn.Conv2d(x, self.nc, 1)) for x in ch])
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
     def forward(self, x):
         shape = x[0].shape  # BCHW
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            y=self.cv1[i](x[i])
+            x[i] = torch.cat((self.cv2[i](y), self.cv3[i](y)), 1)
         if self.training:
             return x
         elif self.dynamic or self.shape != shape:
@@ -420,7 +565,6 @@ class Detect(nn.Module):
         for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
-
 
 class Segment(Detect):
     # YOLOv8 Segment head for segmentation models

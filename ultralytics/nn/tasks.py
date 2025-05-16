@@ -7,7 +7,7 @@ import thop
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules import (C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x, Classify,
+from ultralytics.nn.modules import (C1, C2, C3, C3TR, SPP, SPPF, SPPF_LSKA, Bottleneck, BottleneckCSP, C2f, C2f_DWR, C3Ghost, C3x, Classify,
                                     Concat, Conv, ConvTranspose, Detect, DWConv, DWConvTranspose2d, Ensemble, Focus,
                                     GhostBottleneck, GhostConv, Segment)
 from ultralytics.yolo.utils import DEFAULT_CONFIG_DICT, DEFAULT_CONFIG_KEYS, LOGGER, colorstr, yaml_load
@@ -384,8 +384,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
-                Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
-                BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
+                Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, SPPF_LSKA, DWConv, Focus,
+                BottleneckCSP, C1, C2, C2f, C2f_DWR, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(c2 * gw, 8)
